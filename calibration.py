@@ -1,32 +1,18 @@
 """
-Probability calibration layer — Step 3.
+Probability calibration layer.
 
-Three modes available:
+Purpose:
+  - Keep agent.py focused on raw forecasting.
+  - Apply all probability calibration here.
+  - Avoid overconfident wrong predictions.
+  - Handle unknown future categories by using probability shape and outcome count,
+    not hardcoded category labels.
 
-1. `shrink_to_uniform(probs, alpha)` — fixed-strength shrinkage toward
-   1/N. The original Step 1 baseline. Kept for ablation.
-
-2. `confidence_aware_shrink(probs, base, slope)` — Step 3 default.
-   Shrinks more aggressively when the top probability is far from
-   uniform. This protects against confident-wrong predictions, which
-   pay the largest Brier penalty.
-
-3. `calibrate(probs, mode)` — dispatcher used by predict.py.
-
-Math for confidence-aware shrink:
-    confidence = max(probs) - 1/N
-    alpha_eff = base + slope * confidence
-    p_calibrated = (1 - alpha_eff) * p_raw + alpha_eff * (1/N)
-
-With base=0.05 and slope=0.30:
-  - 0.50/0.50  → alpha=0.05 → barely touched
-  - 0.70/0.30  → alpha=0.11 → light shrink
-  - 0.90/0.10  → alpha=0.17 → harder shrink
-  - 0.99/0.01  → alpha=0.20 → harder still
-
-This matches the observed failure mode in Step 2 (Pakistan 0.68 →
-Bangladesh won, Brier 0.92): we want confident calls to pay a humility
-tax before they get to be wrong.
+Modes:
+  - "multi_outcome_aware" default
+  - "confidence_aware"
+  - "fixed"
+  - "none"
 """
 
 from __future__ import annotations
@@ -34,31 +20,59 @@ from __future__ import annotations
 import os
 
 
-# Step 1 default (kept for comparison)
 DEFAULT_ALPHA = 0.10
 
-# Step 3 defaults
-DEFAULT_BASE = 0.05   # always-applied shrinkage
-DEFAULT_SLOPE = 0.30  # additional shrinkage per unit of confidence-above-uniform
+DEFAULT_BASE = 0.05
+DEFAULT_SLOPE = 0.30
 
-# Step 5 defaults for multi-outcome rule
-DEFAULT_MULTI_N = 10       # minimum outcome count to trigger the rule
-DEFAULT_MULTI_THRESH = 0.20  # top-prob threshold below which we force uniform
+DEFAULT_MULTI_N = 10
+DEFAULT_MULTI_THRESH = 0.20
+
+DEFAULT_LARGE_N = 15
+DEFAULT_LARGE_BASE_BOOST = 0.03
+DEFAULT_LARGE_SLOPE_BOOST = 0.08
+
+DEFAULT_EXTREME_TOP = 0.75
+DEFAULT_EXTREME_EXTRA_SHRINK = 0.08
+
+
+def _normalize(probs: list[float]) -> list[float]:
+    if not probs:
+        return []
+
+    cleaned = []
+    for p in probs:
+        try:
+            p = float(p)
+        except (TypeError, ValueError):
+            p = 0.0
+        cleaned.append(max(0.0, min(1.0, p)))
+
+    total = sum(cleaned)
+    if total <= 0:
+        return [1.0 / len(cleaned)] * len(cleaned)
+
+    return [p / total for p in cleaned]
 
 
 def shrink_to_uniform(probs: list[float], alpha: float = DEFAULT_ALPHA) -> list[float]:
-    """
-    Fixed-strength shrinkage: p_cal = (1-alpha)*p + alpha*(1/N).
-    Used as ablation baseline.
-    """
+    probs = _normalize(probs)
     n = len(probs)
+
     if n == 0:
         return []
     if n == 1:
         return [1.0]
-    a = max(0.0, min(1.0, alpha))
+
+    alpha = max(0.0, min(1.0, alpha))
     uniform_p = 1.0 / n
-    return [(1.0 - a) * p + a * uniform_p for p in probs]
+
+    calibrated = [
+        (1.0 - alpha) * p + alpha * uniform_p
+        for p in probs
+    ]
+
+    return _normalize(calibrated)
 
 
 def confidence_aware_shrink(
@@ -66,30 +80,27 @@ def confidence_aware_shrink(
     base: float = DEFAULT_BASE,
     slope: float = DEFAULT_SLOPE,
 ) -> list[float]:
-    """
-    Confidence-aware shrinkage: shrink harder when more confident.
-
-    Args:
-        probs: raw probabilities
-        base: minimum shrinkage even at zero confidence
-        slope: additional shrinkage per unit of (max(p) - 1/N)
-
-    Returns calibrated probabilities. Preserves sum if input sums to 1
-    (shrinkage toward uniform preserves total mass).
-    """
+    probs = _normalize(probs)
     n = len(probs)
+
     if n == 0:
         return []
     if n == 1:
         return [1.0]
 
     uniform_p = 1.0 / n
-    confidence = max(probs) - uniform_p  # in [0, 1 - 1/N], roughly
+    top_p = max(probs)
+    confidence = max(0.0, top_p - uniform_p)
 
     alpha_eff = base + slope * confidence
     alpha_eff = max(0.0, min(1.0, alpha_eff))
 
-    return [(1.0 - alpha_eff) * p + alpha_eff * uniform_p for p in probs]
+    calibrated = [
+        (1.0 - alpha_eff) * p + alpha_eff * uniform_p
+        for p in probs
+    ]
+
+    return _normalize(calibrated)
 
 
 def multi_outcome_aware(
@@ -98,55 +109,113 @@ def multi_outcome_aware(
     slope: float = DEFAULT_SLOPE,
     multi_n: int = DEFAULT_MULTI_N,
     multi_thresh: float = DEFAULT_MULTI_THRESH,
+    large_n: int = DEFAULT_LARGE_N,
+    large_base_boost: float = DEFAULT_LARGE_BASE_BOOST,
+    large_slope_boost: float = DEFAULT_LARGE_SLOPE_BOOST,
+    extreme_top: float = DEFAULT_EXTREME_TOP,
+    extreme_extra_shrink: float = DEFAULT_EXTREME_EXTRA_SHRINK,
 ) -> list[float]:
     """
-    Multi-outcome aware calibration (Step 5 default).
+    Shape-aware calibration.
 
-    If the event has >= multi_n outcomes AND the model's top prob is below
-    multi_thresh (i.e. the model has no real signal), return exactly uniform.
-    This avoids paying the Brier penalty for noisy near-uniform distributions
-    on large multi-outcome events like reality TV.
-
-    Otherwise delegates to confidence_aware_shrink.
+    Logic:
+      1. Normalize first.
+      2. If many outcomes and model has weak signal, return uniform.
+      3. If many outcomes, apply slightly stronger shrink.
+      4. If very high top probability, add a small humility tax.
+      5. Never hard-cap strong market signals.
     """
+    probs = _normalize(probs)
     n = len(probs)
+
     if n == 0:
         return []
     if n == 1:
         return [1.0]
 
-    if n >= multi_n and max(probs) < multi_thresh:
+    top_p = max(probs)
+
+    # Large-field weak-signal case:
+    # If top probability is very low, the model is basically guessing.
+    if n >= multi_n and top_p < multi_thresh:
         return [1.0 / n] * n
 
-    return confidence_aware_shrink(probs, base=base, slope=slope)
+    effective_base = base
+    effective_slope = slope
+
+    # Unknown final categories are handled by event shape:
+    # large fields get more conservative calibration.
+    if n >= large_n:
+        effective_base += large_base_boost
+        effective_slope += large_slope_boost
+
+    # Very confident forecasts get a little extra shrink,
+    # but not a destructive hard cap.
+    if top_p >= extreme_top:
+        effective_base += extreme_extra_shrink
+
+    return confidence_aware_shrink(
+        probs,
+        base=effective_base,
+        slope=effective_slope,
+    )
 
 
 def calibrate(probs: list[float], mode: str = "multi_outcome_aware") -> list[float]:
     """
-    Top-level dispatcher. predict.py calls this.
+    Dispatcher used by predict.py.
 
-    Reads calibration params from env vars (PROPHET_CAL_BASE, PROPHET_CAL_SLOPE,
-    PROPHET_CAL_MULTI_N, PROPHET_CAL_MULTI_THRESH) so tuning doesn't require
-    code changes.
-
-    mode:
-        "multi_outcome_aware" - Step 5 default (confidence-aware + uniform cutoff)
-        "confidence_aware"    - Step 3 (no multi-outcome cutoff)
-        "fixed"               - Step 1 fixed-alpha shrinkage
-        "none"                - identity (no calibration)
+    Env vars:
+      PROPHET_CAL_BASE
+      PROPHET_CAL_SLOPE
+      PROPHET_CAL_MULTI_N
+      PROPHET_CAL_MULTI_THRESH
+      PROPHET_CAL_LARGE_N
+      PROPHET_CAL_LARGE_BASE_BOOST
+      PROPHET_CAL_LARGE_SLOPE_BOOST
+      PROPHET_CAL_EXTREME_TOP
+      PROPHET_CAL_EXTREME_EXTRA_SHRINK
     """
     base = float(os.environ.get("PROPHET_CAL_BASE", DEFAULT_BASE))
     slope = float(os.environ.get("PROPHET_CAL_SLOPE", DEFAULT_SLOPE))
+
     multi_n = int(os.environ.get("PROPHET_CAL_MULTI_N", DEFAULT_MULTI_N))
     multi_thresh = float(os.environ.get("PROPHET_CAL_MULTI_THRESH", DEFAULT_MULTI_THRESH))
 
+    large_n = int(os.environ.get("PROPHET_CAL_LARGE_N", DEFAULT_LARGE_N))
+    large_base_boost = float(
+        os.environ.get("PROPHET_CAL_LARGE_BASE_BOOST", DEFAULT_LARGE_BASE_BOOST)
+    )
+    large_slope_boost = float(
+        os.environ.get("PROPHET_CAL_LARGE_SLOPE_BOOST", DEFAULT_LARGE_SLOPE_BOOST)
+    )
+
+    extreme_top = float(os.environ.get("PROPHET_CAL_EXTREME_TOP", DEFAULT_EXTREME_TOP))
+    extreme_extra_shrink = float(
+        os.environ.get("PROPHET_CAL_EXTREME_EXTRA_SHRINK", DEFAULT_EXTREME_EXTRA_SHRINK)
+    )
+
     if mode == "multi_outcome_aware":
-        return multi_outcome_aware(probs, base=base, slope=slope,
-                                   multi_n=multi_n, multi_thresh=multi_thresh)
+        return multi_outcome_aware(
+            probs,
+            base=base,
+            slope=slope,
+            multi_n=multi_n,
+            multi_thresh=multi_thresh,
+            large_n=large_n,
+            large_base_boost=large_base_boost,
+            large_slope_boost=large_slope_boost,
+            extreme_top=extreme_top,
+            extreme_extra_shrink=extreme_extra_shrink,
+        )
+
     if mode == "confidence_aware":
         return confidence_aware_shrink(probs, base=base, slope=slope)
+
     if mode == "fixed":
         return shrink_to_uniform(probs)
+
     if mode == "none":
-        return list(probs)
+        return _normalize(probs)
+
     raise ValueError(f"Unknown calibration mode: {mode!r}")

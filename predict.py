@@ -7,14 +7,15 @@ probabilities distribution. The contract:
   - labels match the input outcomes exactly
   - probabilities in [0, 1], summing to 1
 
-Pipeline (Step 3):
+Pipeline:
     event -> agent.forecast() -> calibration.calibrate()
           -> utils.normalize_probabilities() -> validate -> return
 
 If anything fails: utils.safe_fallback() -> uniform distribution.
 
-Calibration mode is set via PROPHET_CALIBRATION_MODE env var, defaults
-to "confidence_aware". Options: "confidence_aware", "fixed", "none".
+Calibration mode is set via PROPHET_CALIBRATION_MODE env var.
+Default: "multi_outcome_aware".
+Options: "confidence_aware", "fixed", "multi_outcome_aware", "none".
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ import traceback
 
 try:
     from dotenv import load_dotenv
+
     load_dotenv()
 except ImportError:
     pass
@@ -50,24 +52,53 @@ def predict(event: dict) -> dict:
     """
     try:
         outcomes = get_outcomes(event)
+
         if not outcomes:
             return {"probabilities": []}
 
         if len(outcomes) == 1:
-            return {"probabilities": [{"market": outcomes[0], "probability": 1.0}]}
+            return {
+                "probabilities": [
+                    {"market": outcomes[0], "probability": 1.0}
+                ]
+            }
 
         from agent import forecast
         from calibration import calibrate
 
         try:
             raw_probs = forecast(event)
+
+            if len(raw_probs) != len(outcomes):
+                print(
+                    f"[predict] forecast returned {len(raw_probs)} probabilities "
+                    f"for {len(outcomes)} outcomes",
+                    file=sys.stderr,
+                )
+                return safe_fallback(event)
+
         except Exception as e:  # noqa: BLE001
             print(f"[predict] forecast() failed: {e}", file=sys.stderr)
             return safe_fallback(event)
 
-        calibrated = calibrate(raw_probs, mode=CALIBRATION_MODE)
+        try:
+            calibrated = calibrate(raw_probs, mode=CALIBRATION_MODE)
 
-        output = {"probabilities": normalize_probabilities(outcomes, calibrated)}
+            if len(calibrated) != len(outcomes):
+                print(
+                    f"[predict] calibration returned {len(calibrated)} probabilities "
+                    f"for {len(outcomes)} outcomes",
+                    file=sys.stderr,
+                )
+                return safe_fallback(event)
+
+        except Exception as e:  # noqa: BLE001
+            print(f"[predict] calibration failed: {e}", file=sys.stderr)
+            calibrated = raw_probs
+
+        output = {
+            "probabilities": normalize_probabilities(outcomes, calibrated)
+        }
 
         if not validate_output(output, event):
             print("[predict] validation failed, falling back to uniform", file=sys.stderr)
@@ -91,5 +122,7 @@ if __name__ == "__main__":
         "close_time": "2026-03-21T23:59:59+00:00",
         "outcomes": ["Pittsburgh", "Atlanta"],
     }
+
     import json
+
     print(json.dumps(predict(sample_event), indent=2))
