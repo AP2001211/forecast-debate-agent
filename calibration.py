@@ -1,51 +1,75 @@
 """
-Probability calibration layer.
+Probability calibration layer — Step 3.
 
-The LLM produces raw probabilities. Brier score penalizes overconfident
-wrong answers heavily, so we apply a calibration step that pulls
-probabilities toward the uniform prior (1/N over N outcomes).
+Three modes available:
 
-The shrinkage formula:
-    p_calibrated = (1 - alpha) * p_raw + alpha * (1 / N)
+1. `shrink_to_uniform(probs, alpha)` — fixed-strength shrinkage toward
+   1/N. The original Step 1 baseline. Kept for ablation.
 
-With alpha=0.10, a raw probability of 0.90 on a binary becomes 0.86.
-A raw probability of 0.50 stays at 0.50. The pull is symmetric around
-the uniform prior.
+2. `confidence_aware_shrink(probs, base, slope)` — Step 3 default.
+   Shrinks more aggressively when the top probability is far from
+   uniform. This protects against confident-wrong predictions, which
+   pay the largest Brier penalty.
 
-This is a deliberately simple baseline. In Step 4+ we'll consider:
-  - alpha tuned per-category (Sports vs Economics vs Entertainment)
-  - alpha that scales with the LLM's self-reported confidence
-  - non-linear methods like temperature scaling, fitted on sample-resolved
+3. `calibrate(probs, mode)` — dispatcher used by predict.py.
+
+Math for confidence-aware shrink:
+    confidence = max(probs) - 1/N
+    alpha_eff = base + slope * confidence
+    p_calibrated = (1 - alpha_eff) * p_raw + alpha_eff * (1/N)
+
+With base=0.05 and slope=0.30:
+  - 0.50/0.50  → alpha=0.05 → barely touched
+  - 0.70/0.30  → alpha=0.11 → light shrink
+  - 0.90/0.10  → alpha=0.17 → harder shrink
+  - 0.99/0.01  → alpha=0.20 → harder still
+
+This matches the observed failure mode in Step 2 (Pakistan 0.68 →
+Bangladesh won, Brier 0.92): we want confident calls to pay a humility
+tax before they get to be wrong.
 """
 
 from __future__ import annotations
 
 
-# Strength of shrinkage toward uniform prior.
-# 0.0 = no calibration (trust the model fully)
-# 1.0 = full shrinkage (always return uniform)
-# 0.10 = pull 10% of the way toward uniform. Light touch for a strong
-#        model that's already reasonably well-calibrated.
+# Step 1 default (kept for comparison)
 DEFAULT_ALPHA = 0.10
+
+# Step 3 defaults
+DEFAULT_BASE = 0.05   # always-applied shrinkage
+DEFAULT_SLOPE = 0.30  # additional shrinkage per unit of confidence-above-uniform
 
 
 def shrink_to_uniform(probs: list[float], alpha: float = DEFAULT_ALPHA) -> list[float]:
     """
-    Pull each probability `alpha` of the way toward the uniform prior 1/N.
+    Fixed-strength shrinkage: p_cal = (1-alpha)*p + alpha*(1/N).
+    Used as ablation baseline.
+    """
+    n = len(probs)
+    if n == 0:
+        return []
+    if n == 1:
+        return [1.0]
+    a = max(0.0, min(1.0, alpha))
+    uniform_p = 1.0 / n
+    return [(1.0 - a) * p + a * uniform_p for p in probs]
+
+
+def confidence_aware_shrink(
+    probs: list[float],
+    base: float = DEFAULT_BASE,
+    slope: float = DEFAULT_SLOPE,
+) -> list[float]:
+    """
+    Confidence-aware shrinkage: shrink harder when more confident.
 
     Args:
-        probs: raw probabilities. Assumed (but not required) to be non-negative.
-        alpha: shrinkage strength in [0, 1]. Clamped if outside.
+        probs: raw probabilities
+        base: minimum shrinkage even at zero confidence
+        slope: additional shrinkage per unit of (max(p) - 1/N)
 
-    Returns:
-        Calibrated probabilities, same length as input. Does NOT renormalize
-        to sum to 1 — the caller (predict.py's normalize_probabilities) handles
-        that. We don't need to here because shrinkage toward 1/N preserves
-        any sum=1 input as sum=1 output.
-
-    Special cases:
-        - Empty list: returns empty list.
-        - Single outcome: returns [1.0] regardless of input.
+    Returns calibrated probabilities. Preserves sum if input sums to 1
+    (shrinkage toward uniform preserves total mass).
     """
     n = len(probs)
     if n == 0:
@@ -53,8 +77,28 @@ def shrink_to_uniform(probs: list[float], alpha: float = DEFAULT_ALPHA) -> list[
     if n == 1:
         return [1.0]
 
-    # Clamp alpha to [0, 1]
-    a = max(0.0, min(1.0, alpha))
     uniform_p = 1.0 / n
+    confidence = max(probs) - uniform_p  # in [0, 1 - 1/N], roughly
 
-    return [(1.0 - a) * p + a * uniform_p for p in probs]
+    alpha_eff = base + slope * confidence
+    alpha_eff = max(0.0, min(1.0, alpha_eff))
+
+    return [(1.0 - alpha_eff) * p + alpha_eff * uniform_p for p in probs]
+
+
+def calibrate(probs: list[float], mode: str = "confidence_aware") -> list[float]:
+    """
+    Top-level dispatcher. predict.py calls this.
+
+    mode:
+        "confidence_aware" - Step 3 default
+        "fixed"            - Step 1 fixed-alpha shrinkage
+        "none"             - identity (no calibration)
+    """
+    if mode == "confidence_aware":
+        return confidence_aware_shrink(probs)
+    if mode == "fixed":
+        return shrink_to_uniform(probs)
+    if mode == "none":
+        return list(probs)
+    raise ValueError(f"Unknown calibration mode: {mode!r}")

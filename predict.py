@@ -7,31 +7,26 @@ probabilities distribution. The contract:
   - labels match the input outcomes exactly
   - probabilities in [0, 1], summing to 1
 
-This file is the public surface. All complexity (LLM call, calibration)
-lives in modules called from here. Any exception inside results in a
-uniform fallback rather than a crash — completion rate matters.
-
-Pipeline (Step 1):
-    event -> agent.forecast() -> calibration.shrink_to_uniform()
+Pipeline (Step 3):
+    event -> agent.forecast() -> calibration.calibrate()
           -> utils.normalize_probabilities() -> validate -> return
 
 If anything fails: utils.safe_fallback() -> uniform distribution.
+
+Calibration mode is set via PROPHET_CALIBRATION_MODE env var, defaults
+to "confidence_aware". Options: "confidence_aware", "fixed", "none".
 """
 
 from __future__ import annotations
 
+import os
 import sys
 import traceback
 
-# Load .env automatically when this module is imported, so the OPENROUTER_API_KEY
-# is available without the caller having to source the file manually.
 try:
     from dotenv import load_dotenv
-
     load_dotenv()
 except ImportError:
-    # python-dotenv is optional — if not installed, expect env vars
-    # to be set externally.
     pass
 
 from utils import (
@@ -40,6 +35,9 @@ from utils import (
     safe_fallback,
     validate_output,
 )
+
+
+CALIBRATION_MODE = os.environ.get("PROPHET_CALIBRATION_MODE", "confidence_aware")
 
 
 def predict(event: dict) -> dict:
@@ -55,15 +53,11 @@ def predict(event: dict) -> dict:
         if not outcomes:
             return {"probabilities": []}
 
-        # Single-outcome edge case: no LLM call needed.
         if len(outcomes) == 1:
             return {"probabilities": [{"market": outcomes[0], "probability": 1.0}]}
 
-        # Run the LLM forecaster. Imported lazily so that if openai isn't
-        # installed (e.g. during the Step 0 test pass), the rest of the
-        # module still works for the trivial paths.
         from agent import forecast
-        from calibration import shrink_to_uniform
+        from calibration import calibrate
 
         try:
             raw_probs = forecast(event)
@@ -71,10 +65,8 @@ def predict(event: dict) -> dict:
             print(f"[predict] forecast() failed: {e}", file=sys.stderr)
             return safe_fallback(event)
 
-        # Calibrate (light shrinkage toward uniform)
-        calibrated = shrink_to_uniform(raw_probs)
+        calibrated = calibrate(raw_probs, mode=CALIBRATION_MODE)
 
-        # Normalize, validate, return
         output = {"probabilities": normalize_probabilities(outcomes, calibrated)}
 
         if not validate_output(output, event):
