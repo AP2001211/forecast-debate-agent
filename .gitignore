@@ -1,3 +1,8 @@
 .env
 __pycache__/
 *.pyc
+
+# Eval data files — code is committed, data is local
+eval/data/*.json
+eval/data/*.jsonl
+eval/data/reports/
