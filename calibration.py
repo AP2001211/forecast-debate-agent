@@ -31,6 +31,8 @@ tax before they get to be wrong.
 
 from __future__ import annotations
 
+import os
+
 
 # Step 1 default (kept for comparison)
 DEFAULT_ALPHA = 0.10
@@ -38,6 +40,10 @@ DEFAULT_ALPHA = 0.10
 # Step 3 defaults
 DEFAULT_BASE = 0.05   # always-applied shrinkage
 DEFAULT_SLOPE = 0.30  # additional shrinkage per unit of confidence-above-uniform
+
+# Step 5 defaults for multi-outcome rule
+DEFAULT_MULTI_N = 10       # minimum outcome count to trigger the rule
+DEFAULT_MULTI_THRESH = 0.20  # top-prob threshold below which we force uniform
 
 
 def shrink_to_uniform(probs: list[float], alpha: float = DEFAULT_ALPHA) -> list[float]:
@@ -86,17 +92,59 @@ def confidence_aware_shrink(
     return [(1.0 - alpha_eff) * p + alpha_eff * uniform_p for p in probs]
 
 
-def calibrate(probs: list[float], mode: str = "confidence_aware") -> list[float]:
+def multi_outcome_aware(
+    probs: list[float],
+    base: float = DEFAULT_BASE,
+    slope: float = DEFAULT_SLOPE,
+    multi_n: int = DEFAULT_MULTI_N,
+    multi_thresh: float = DEFAULT_MULTI_THRESH,
+) -> list[float]:
+    """
+    Multi-outcome aware calibration (Step 5 default).
+
+    If the event has >= multi_n outcomes AND the model's top prob is below
+    multi_thresh (i.e. the model has no real signal), return exactly uniform.
+    This avoids paying the Brier penalty for noisy near-uniform distributions
+    on large multi-outcome events like reality TV.
+
+    Otherwise delegates to confidence_aware_shrink.
+    """
+    n = len(probs)
+    if n == 0:
+        return []
+    if n == 1:
+        return [1.0]
+
+    if n >= multi_n and max(probs) < multi_thresh:
+        return [1.0 / n] * n
+
+    return confidence_aware_shrink(probs, base=base, slope=slope)
+
+
+def calibrate(probs: list[float], mode: str = "multi_outcome_aware") -> list[float]:
     """
     Top-level dispatcher. predict.py calls this.
 
+    Reads calibration params from env vars (PROPHET_CAL_BASE, PROPHET_CAL_SLOPE,
+    PROPHET_CAL_MULTI_N, PROPHET_CAL_MULTI_THRESH) so tuning doesn't require
+    code changes.
+
     mode:
-        "confidence_aware" - Step 3 default
-        "fixed"            - Step 1 fixed-alpha shrinkage
-        "none"             - identity (no calibration)
+        "multi_outcome_aware" - Step 5 default (confidence-aware + uniform cutoff)
+        "confidence_aware"    - Step 3 (no multi-outcome cutoff)
+        "fixed"               - Step 1 fixed-alpha shrinkage
+        "none"                - identity (no calibration)
     """
+    base = float(os.environ.get("PROPHET_CAL_BASE", DEFAULT_BASE))
+    slope = float(os.environ.get("PROPHET_CAL_SLOPE", DEFAULT_SLOPE))
+    multi_n = int(os.environ.get("PROPHET_CAL_MULTI_N", DEFAULT_MULTI_N))
+    multi_thresh = float(os.environ.get("PROPHET_CAL_MULTI_THRESH", DEFAULT_MULTI_THRESH))
+
+    if mode == "multi_outcome_aware":
+        return multi_outcome_aware(probs, base=base, slope=slope,
+                                   multi_n=multi_n, multi_thresh=multi_thresh)
     if mode == "confidence_aware":
-        return confidence_aware_shrink(probs)
+        return confidence_aware_shrink(probs, base=base, slope=slope)
     if mode == "fixed":
         return shrink_to_uniform(probs)
     if mode == "none":

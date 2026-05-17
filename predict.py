@@ -37,7 +37,7 @@ from utils import (
 )
 
 
-CALIBRATION_MODE = os.environ.get("PROPHET_CALIBRATION_MODE", "confidence_aware")
+CALIBRATION_MODE = os.environ.get("PROPHET_CALIBRATION_MODE", "multi_outcome_aware")
 
 
 def predict(event: dict) -> dict:

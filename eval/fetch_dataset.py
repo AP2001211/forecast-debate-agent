@@ -53,17 +53,35 @@ def fetch_dataset(dataset: str, output_path: str, include_resolved: bool = True)
     if include_resolved:
         cmd.append("--include-resolved")
 
+    # Force UTF-8 I/O so Windows cp1252 doesn't crash when the CLI prints
+    # non-ASCII characters (e.g. team names with accented letters).
+    cli_env = os.environ.copy()
+    cli_env["PYTHONIOENCODING"] = "utf-8"
+
     print(f"[fetch] running: {' '.join(cmd)}")
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=cli_env,
+    )
 
     if result.returncode != 0:
         # Surface the CLI's stderr so the user can see what went wrong
-        print(f"[fetch] CLI failed (exit code {result.returncode})")
+        print(f"[fetch] CLI exited with code {result.returncode}")
         if result.stdout:
             print(f"  stdout: {result.stdout}")
         if result.stderr:
             print(f"  stderr: {result.stderr}")
-        raise RuntimeError("prophet CLI invocation failed; see output above.")
+        # On Windows the CLI sometimes crashes after writing the file
+        # (UnicodeEncodeError on the summary print).  If the output file
+        # exists and is valid JSON we treat that as success with a warning.
+        if out.exists():
+            print("[fetch] WARNING: CLI exited non-zero but output file exists — treating as success.")
+        else:
+            raise RuntimeError("prophet CLI invocation failed; see output above.")
 
     # Read the output and tell the caller how many events we got
     with open(out, "r", encoding="utf-8") as f:
