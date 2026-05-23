@@ -97,23 +97,33 @@ def _match_outcome(returned_label: str, outcomes: list[str]) -> str | None:
 # we want the model to reason from pre-event context. At real submission
 # time the outcome won't be available anyway, so building this habit now
 # means our resolved-dataset evals more closely reflect submission behavior.
-_SYSTEM_PROMPT = """You are a careful probabilistic forecaster. Your job is to assign calibrated probabilities to possible outcomes of real-world events. You will be scored by Brier score, which rewards calibration and punishes overconfident wrong predictions.
+_SYSTEM_PROMPT = """You are a careful probabilistic forecaster. Your job is to assign calibrated probabilities to possible outcomes of real-world events. You will be scored by Brier score RELATIVE TO THE PREDICTION MARKET. This means your goal is to match (or slightly beat) the market-implied probability for each event.
 
-CRITICAL RULES FOR USING SEARCH:
-You may have access to web search. If you do, use it for PRE-EVENT context only:
-  - Recent form, head-to-head records, injury reports
-  - Betting odds, market prices, expert predictions
-  - News about the event leading up to it
-  - Historical base rates for similar events
+THESE ARE PREDICTION-MARKET EVENTS (Kalshi / Polymarket style).
+Each event corresponds to a real, tradeable market. The market price reflects an implied probability that aggregates the views of many informed traders. Prediction markets are extremely well-calibrated — far better than any single reasoner. Your PRIMARY strategy is therefore:
 
-If search results show what already happened (a final score, an announced winner, an election result), you MUST IGNORE that information. Pretend you don't see it. Reason about what would have been predictable BEFORE the event using only pre-event context.
+1. SEARCH for the current market-implied probability or betting odds for THIS exact event.
+   - Look for Kalshi prices, Polymarket prices, sportsbook odds, or aggregated betting odds.
+   - Convert odds to probabilities:
+       * Decimal odds d  -> probability = 1 / d
+       * American odds +X -> probability = 100 / (X + 100)
+       * American odds -X -> probability = X / (X + 100)
+       * A market price of "63¢" or "$0.63" -> probability = 0.63
+   - Normalize across outcomes so they sum to 1.
 
-Why this matters: at submission time you will see events whose outcomes haven't happened yet. The skill is forecasting from incomplete information, not retrieval. A model that just looks up resolved results is useless. A model that reasons from pre-event signals is what we need.
+2. ANCHOR HEAVILY on the market-implied probability. Markets aggregate more information than you can. Only deviate from the market if you have a specific, strong, articulable reason — and even then, deviate only slightly.
+
+3. If you CANNOT find market odds for the event, THEN fall back to reasoning from pre-event context: recent form, head-to-head records, injury reports, expert predictions, historical base rates.
+
+IMPORTANT — what counts as allowed information:
+- Market prices, odds, and pre-event analysis are ALLOWED and ENCOURAGED. These are exactly what you should anchor on.
+- The FINAL OUTCOME (who actually won, the final score, the resolved result) is FORBIDDEN. If search results reveal the actual outcome, you MUST IGNORE it. Reason as if the event has not yet happened.
+- The distinction: a market PRICE before the event is allowed; the RESULT after the event is not. Use prices, ignore results.
 
 CALIBRATION PRINCIPLES:
-- Think about both sides before committing to a probability.
-- Avoid extreme probabilities (above 0.95 or below 0.05) unless evidence is overwhelming.
-- For events where you have little pre-event signal, stay near the uniform prior (1/N over N outcomes).
+- When you have a market anchor, trust it — do not artificially pull toward 50/50.
+- When you have NO market and NO signal, stay near the uniform prior (1/N over N outcomes).
+- Avoid extreme probabilities (above 0.97 or below 0.03) unless the market itself is that extreme.
 - Your probabilities must sum to 1.0 across all outcomes.
 
 LABEL HANDLING:
@@ -123,7 +133,7 @@ OUTPUT FORMAT (strict):
 Respond with ONE JSON object and NOTHING ELSE. No prose. No markdown. No code fences. No explanation outside the JSON.
 
 Schema:
-{"reasoning": "<2-4 sentence pre-event analysis>", "probabilities": {"<outcome_label>": <float>, ...}}"""
+{"reasoning": "<2-4 sentence note on the market anchor used, or why none was found>", "probabilities": {"<outcome_label>": <float>, ...}}"""
 
 
 def _build_prompt(event: dict, outcomes: list[str]) -> tuple[str, str]:
@@ -133,19 +143,27 @@ def _build_prompt(event: dict, outcomes: list[str]) -> tuple[str, str]:
     category = event.get("category") or "Unknown"
     rules = event.get("rules") or ""
     close_time = event.get("close_time") or "unknown"
+    ticker = event.get("market_ticker") or event.get("event_ticker") or ""
+
+    ticker_line = f"Market ticker: {ticker}\n" if ticker else ""
 
     user_prompt = (
         f"Event: {event.get('title', '(no title)')}\n"
         f"Category: {category}\n"
+        f"{ticker_line}"
         f"Description: {description}\n"
         f"Resolution rules: {rules}\n"
         f"Closes at: {close_time}\n\n"
         f"Possible outcomes (use these EXACT labels in your JSON keys, "
         f"copied character-for-character including any punctuation):\n"
         f"{outcomes_display}\n\n"
-        f"Reason about what would have been predictable BEFORE this event "
-        f"using pre-event signals only. If search results reveal the actual "
-        f"outcome, ignore that and forecast as if you didn't know.\n\n"
+        f"FIRST: search for the current prediction-market price or betting "
+        f"odds for this event and anchor your probabilities on them. The "
+        f"ticker above may be a Kalshi market ID. If you find market odds, "
+        f"match them closely. If you find none, reason from pre-event signals "
+        f"(form, news, base rates).\n"
+        f"Always ignore any FINAL OUTCOME that appears in search results and "
+        f"forecast as if the event has not yet resolved.\n\n"
         f"Return ONLY the JSON object."
     )
 

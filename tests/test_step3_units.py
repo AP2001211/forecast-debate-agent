@@ -135,7 +135,7 @@ def test_confidence_aware_barely_touches_uniform():
 
 def test_confidence_aware_moderate_shrinks_lightly():
     """0.7/0.3 → alpha = 0.05 + 0.30*(0.7 - 0.5) = 0.11"""
-    out = confidence_aware_shrink([0.7, 0.3])
+    out = confidence_aware_shrink([0.7, 0.3], base=0.05, slope=0.30)
     expected_alpha = 0.05 + 0.30 * 0.2
     expected_0 = (1 - expected_alpha) * 0.7 + expected_alpha * 0.5
     expected_1 = (1 - expected_alpha) * 0.3 + expected_alpha * 0.5
@@ -145,7 +145,7 @@ def test_confidence_aware_moderate_shrinks_lightly():
 
 def test_confidence_aware_extreme_shrinks_more():
     """0.95/0.05 should pull noticeably toward 0.5."""
-    out = confidence_aware_shrink([0.95, 0.05])
+    out = confidence_aware_shrink([0.95, 0.05], base=0.05, slope=0.30)
     # confidence = 0.45, alpha = 0.05 + 0.30*0.45 = 0.185
     # 0.95 becomes (1-0.185)*0.95 + 0.185*0.5 ≈ 0.867
     # Sanity: pulled at least 0.05 toward the center
@@ -164,7 +164,7 @@ def test_confidence_aware_more_aggressive_than_fixed_at_extremes():
     """At high confidence, the new method should shrink more than fixed alpha=0.10."""
     extreme = [0.95, 0.05]
     fixed = shrink_to_uniform(extreme, alpha=0.10)
-    aware = confidence_aware_shrink(extreme)
+    aware = confidence_aware_shrink(extreme, base=0.05, slope=0.30)
     # aware[0] should be smaller than fixed[0] (more shrinkage = closer to 0.5)
     assert aware[0] < fixed[0]
     assert aware[1] > fixed[1]

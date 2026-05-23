@@ -38,8 +38,9 @@ import os
 DEFAULT_ALPHA = 0.10
 
 # Step 3 defaults
-DEFAULT_BASE = 0.05   # always-applied shrinkage
-DEFAULT_SLOPE = 0.30  # additional shrinkage per unit of confidence-above-uniform
+# Lowered so we trust market-anchored outputs instead of pulling them toward uniform.
+DEFAULT_BASE = float(os.environ.get("PROPHET_CAL_BASE", "0.02"))
+DEFAULT_SLOPE = float(os.environ.get("PROPHET_CAL_SLOPE", "0.15"))
 
 # Step 5 defaults for multi-outcome rule
 DEFAULT_MULTI_N = 10       # minimum outcome count to trigger the rule
